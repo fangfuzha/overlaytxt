@@ -1,0 +1,34 @@
+[package]
+name = "overlaytxt"
+version = "0.1.0"
+edition = "2024"
+authors = ["fangfuzha <3073303884@qq.com>"]
+description = "Transparent overlay danmaku (scrolling text) rendering library for Windows, powered by Direct2D + DirectWrite + DirectComposition"
+repository = "https://github.com/fangfuzha/overlaytxt"
+homepage = "https://github.com/fangfuzha/overlaytxt"
+license = "MIT"
+keywords = ["danmaku", "bullet-comments", "scrolling-text", "overlay", "windows", "transparent"]
+categories = ["gui", "multimedia::video", "os::windows-apis"]
+
+[dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+]}
+windows-numerics = "0.3.1"
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
