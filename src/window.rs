@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::*;
@@ -82,7 +83,7 @@ pub struct WindowConfig {
 /// 2. 创建全屏顶层覆盖窗口（`WS_EX_LAYERED | WS_EX_TRANSPARENT`）
 /// 3. 初始化 DComp 渲染器
 /// 4. 初始化弹幕管理器
-/// 5. 进入基于 `PeekMessageW` 的非阻塞消息循环（≈60 FPS）
+/// 5. 进入帧循环，通过 `DwmFlush` 与屏幕 VSync 同步（自动适配 60/120/144/240Hz）
 ///
 /// 窗口关闭条件：
 /// - 收到 `WM_DESTROY` 或 `WM_QUIT`
@@ -119,151 +120,170 @@ pub fn run_window(
 			config.display_area_percent,
 		);
 
-		// ── 定时器 (≈60 FPS) ──
-		let timer_id: usize = 1;
-		SetTimer(Some(hwnd), timer_id, 16, None);
+			// ── 帧同步：使用 DwmFlush 适配屏幕刷新率 ──
+			// DwmFlush 阻塞直到下一次垂直消隐（VSync），自动适配 60/120/144/240Hz 等刷新率。
+			// 不再使用硬编码的 16ms 定时器，帧率与显示器刷新率精确同步。
+			let mut last_time = std::time::Instant::now();
+			let mut msg = MSG::default();
+			let mut running = true;
 
-		let mut last_time = std::time::Instant::now();
-		let mut msg = MSG::default();
-		let mut running = true;
-
-		while running {
-			let has_message = PeekMessageW(&mut msg, Some(hwnd), 0, 0, PM_REMOVE).as_bool();
-
-			if has_message {
-				match msg.message {
-					WM_DESTROY | WM_QUIT => {
-						running = false;
-						continue;
+			while running {
+				// 先处理所有待处理消息（非阻塞），确保退出和命令响应的及时性
+				while PeekMessageW(&mut msg, Some(hwnd), 0, 0, PM_REMOVE).as_bool() {
+					match msg.message {
+						WM_DESTROY | WM_QUIT => {
+							running = false;
+							break;
+						}
+						_ => {
+							let _ = TranslateMessage(&msg);
+							DispatchMessageW(&msg);
+						}
 					}
-					WM_TIMER if msg.wParam.0 == timer_id => {
-						let now = std::time::Instant::now();
-						let dt = (now - last_time).as_secs_f32().min(0.1);
-						last_time = now;
+				}
+				if !running {
+					break;
+				}
 
-						// 处理新命令
-						if let Ok(rx) = command_rx.lock() {
-							while let Ok(cmd) = rx.try_recv() {
-								match cmd {
-									RenderCommand::AddDanmaku { text, font_size, color, speed } => {
-										let text_utf16: Vec<u16> = text.encode_utf16().collect();
-										let text_width = renderer
-											.measure_text_width(&text_utf16, font_size)
-											.unwrap_or(100.0);
-										manager.add_text(
-											text_utf16, font_size, color, speed, text_width,
-										);
-									}
-									RenderCommand::AddInlineDanmaku { segments, speed } => {
-										let mut processed = Vec::new();
-										let mut total_width = 0.0_f32;
+				// ── 等待 VSync ──
+				// DwmFlush 阻塞到 DWM 完成一次合成周期（即下一次 VSync），
+				// 返回后即可渲染下一帧。因为 VSync 间隔由显示器刷新率决定，
+				// 所以帧率自动匹配屏幕：60Hz → ~16.6ms, 144Hz → ~6.9ms。
+				// 若失败（如 DWM 未运行），回退 1ms 睡眠避免忙碌等待。
+				if let Err(e) = DwmFlush() {
+					log::warn!("DwmFlush failed ({}), fallback to 1ms sleep", e);
+					std::thread::sleep(std::time::Duration::from_millis(1));
+				}
 
-										// 先扫描所有文字段，取最大字号作为图片的缩放目标高度
-										let target_img_height = segments
-											.iter()
-											.filter_map(|seg| match seg {
-												InlineContent::Text { font_size, .. } => {
-													Some(*font_size)
-												}
-												InlineContent::Image { .. } => None,
-											})
-											.fold(0.0_f32, f32::max)
-											.max(16.0); // 最低 16px 保底
+				let now = std::time::Instant::now();
+				let dt = (now - last_time).as_secs_f32().min(0.1);
+				last_time = now;
 
-										for seg in segments {
-											match seg {
-												InlineContent::Text { text, font_size, color } => {
-													let text_utf16: Vec<u16> =
-														text.encode_utf16().collect();
-													let w = renderer
-														.measure_text_width(&text_utf16, font_size)
-														.unwrap_or(100.0);
-													total_width += w;
-													processed.push(ProcessedSegment::Text {
-														text: text_utf16,
-														font_size,
-														color,
-														width: w,
-													});
-												}
-												InlineContent::Image { rgba, width, height } => {
-													if let Ok(bitmap) = renderer
-														.create_bitmap_from_rgba(
-															&rgba, width, height,
-														) {
-														// 等比缩放：图片高度对齐文字高度，宽度按比例缩放
-														let scale =
-															target_img_height / height as f32;
-														let w = width as f32 * scale;
-														let h = target_img_height;
-														// DWrite 文字在字形上方留有内部 leading，图片下移以视觉对齐
-														let y_offset = target_img_height * 0.15;
-														total_width += w;
-														processed.push(ProcessedSegment::Image {
-															bitmap,
-															width: w,
-															height: h,
-															y_offset,
-														});
-													}
-												}
-											}
-										}
-										if !processed.is_empty() {
-											manager.add_inline(processed, speed, total_width);
-										}
-									}
-									RenderCommand::SetDisplayAreaPercent(percent) => {
-										let display_h =
-											(config.screen_height as f32 * percent).ceil() as u32;
-										renderer.set_display_area_height(display_h);
-										manager.set_display_area_percent(percent);
-									}
-									RenderCommand::SetTrackHeight(track_height) => {
-										manager.set_track_height(track_height);
-									}
-									RenderCommand::SetBackgroundEnabled(enabled) => {
-										renderer.set_background_enabled(enabled);
-									}
-									RenderCommand::SetBackgroundOpacity(opacity) => {
-										renderer.set_background_opacity(opacity);
-									}
-									RenderCommand::ClearAll => {
-										manager.clear_danmaku();
-									}
-									RenderCommand::Pause => {
-										manager.pause();
-										paused.store(true, Ordering::SeqCst);
-									}
-									RenderCommand::Resume => {
-										manager.resume();
-										paused.store(false, Ordering::SeqCst);
-									}
-									RenderCommand::SetMaxDanmaku(max) => {
-										manager.set_max_danmaku(max);
-									}
-									RenderCommand::Quit => running = false,
+				// 处理新命令
+				if let Ok(rx) = command_rx.lock() {
+					while let Ok(cmd) = rx.try_recv() {
+						match cmd {
+							RenderCommand::AddDanmaku { text, font_size, color, speed } => {
+							let text_utf16: Vec<u16> = text.encode_utf16().collect();
+							match renderer.build_text_layout(&text_utf16, font_size) {
+								Ok((layout, text_width)) => {
+									manager.add_text(
+										text_utf16, font_size, color, speed, text_width, layout,
+									);
+								}
+								Err(e) => {
+									log::warn!("build_text_layout failed for AddDanmaku: {}", e);
 								}
 							}
 						}
+							RenderCommand::AddInlineDanmaku { segments, speed } => {
+								let mut processed = Vec::new();
+								let mut total_width = 0.0_f32;
 
-						manager.update(dt);
-						if let Err(e) = renderer.render(manager.active_items()) {
-							log::error!("Render error: {}", e);
+								// 先扫描所有文字段，取最大字号作为图片的缩放目标高度
+								let target_img_height = segments
+									.iter()
+									.filter_map(|seg| match seg {
+										InlineContent::Text { font_size, .. } => {
+											Some(*font_size)
+										}
+										InlineContent::Image { .. } => None,
+									})
+									.fold(0.0_f32, f32::max)
+									.max(16.0); // 最低 16px 保底
+
+								for seg in segments {
+									match seg {
+										InlineContent::Text { text, font_size, color } => {
+										let text_utf16: Vec<u16> =
+											text.encode_utf16().collect();
+										match renderer.build_text_layout(&text_utf16, font_size) {
+											Ok((layout, w)) => {
+												total_width += w;
+												processed.push(ProcessedSegment::Text {
+													text: text_utf16,
+													font_size,
+													color,
+													width: w,
+													layout,
+												});
+											}
+											Err(e) => {
+												log::warn!(
+													"build_text_layout failed for inline text: {}",
+													e
+												);
+											}
+										}
+									}
+										InlineContent::Image { rgba, width, height } => {
+											if let Ok(bitmap) = renderer
+												.create_bitmap_from_rgba(
+													&rgba, width, height,
+												) {
+												// 等比缩放：图片高度对齐文字高度，宽度按比例缩放
+												let scale =
+													target_img_height / height as f32;
+												let w = width as f32 * scale;
+												let h = target_img_height;
+												// DWrite 文字在字形上方留有内部 leading，图片下移以视觉对齐
+												let y_offset = target_img_height * 0.15;
+												total_width += w;
+												processed.push(ProcessedSegment::Image {
+													bitmap,
+													width: w,
+													height: h,
+													y_offset,
+												});
+											}
+										}
+									}
+								}
+								if !processed.is_empty() {
+									manager.add_inline(processed, speed, total_width);
+								}
+							}
+							RenderCommand::SetDisplayAreaPercent(percent) => {
+								let display_h =
+									(config.screen_height as f32 * percent).ceil() as u32;
+								renderer.set_display_area_height(display_h);
+								manager.set_display_area_percent(percent);
+							}
+							RenderCommand::SetTrackHeight(track_height) => {
+								manager.set_track_height(track_height);
+							}
+							RenderCommand::SetBackgroundEnabled(enabled) => {
+								renderer.set_background_enabled(enabled);
+							}
+							RenderCommand::SetBackgroundOpacity(opacity) => {
+								renderer.set_background_opacity(opacity);
+							}
+							RenderCommand::ClearAll => {
+								manager.clear_danmaku();
+							}
+							RenderCommand::Pause => {
+								manager.pause();
+								paused.store(true, Ordering::SeqCst);
+							}
+							RenderCommand::Resume => {
+								manager.resume();
+								paused.store(false, Ordering::SeqCst);
+							}
+							RenderCommand::SetMaxDanmaku(max) => {
+								manager.set_max_danmaku(max);
+							}
+							RenderCommand::Quit => running = false,
 						}
 					}
-					_ => {
-						let _ = TranslateMessage(&msg);
-						DispatchMessageW(&msg);
-					}
 				}
-			} else {
-				std::thread::sleep(std::time::Duration::from_millis(1));
-			}
-		}
 
-		KillTimer(Some(hwnd), timer_id)?;
-		let _ = DestroyWindow(hwnd);
+				manager.update(dt);
+				if let Err(e) = renderer.render(manager.active_items()) {
+					log::error!("Render error: {}", e);
+				}
+			}
+
+			let _ = DestroyWindow(hwnd);
 		Ok(())
 	}
 }
@@ -346,14 +366,21 @@ unsafe fn create_window(width: u32, height: u32) -> Result<HWND> {
 
 /// 窗口过程函数。
 ///
-/// 所有消息交由 [`DefWindowProcW`] 默认处理。
+/// 处理 `WM_NCHITTEST` 返回 `HTTRANSPARENT`，使鼠标事件完全穿透覆盖层，
+/// 避免（1）屏幕边缘出现 resize 光标、（2）拦截自动隐藏任务栏的弹出。
+/// 其余消息交由 [`DefWindowProcW`] 默认处理。
 unsafe extern "system" fn window_proc(
 	hwnd: HWND,
 	msg: u32,
 	wparam: WPARAM,
 	lparam: LPARAM,
 ) -> LRESULT {
-	unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+	unsafe {
+		if msg == WM_NCHITTEST {
+			return LRESULT(HTTRANSPARENT as isize);
+		}
+		DefWindowProcW(hwnd, msg, wparam, lparam)
+	}
 }
 
 /// 获取虚拟桌面尺寸（物理像素）。

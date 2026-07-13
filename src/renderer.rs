@@ -56,9 +56,10 @@ pub struct DcompRenderer {
 	/// `None` 表示系统不支持（非 Windows 10+）。
 	emoji_fallback: Option<IDWriteFontFallback>,
 	/// DXGI 交换链，通过 DComp 合成到窗口。
-	swapchain: IDXGISwapChain1,
+	///
+	/// 使用 `IDXGISwapChain3` 以访问 `GetCurrentBackBufferIndex`（DXGI 1.3+，Windows 8.1+）。
+	swapchain: IDXGISwapChain3,
 	/// 屏幕宽度（物理像素）。
-	#[allow(dead_code)]
 	screen_width: u32,
 	/// 屏幕高度（物理像素）。
 	#[allow(dead_code)]
@@ -74,6 +75,11 @@ pub struct DcompRenderer {
 	text_format_cache: RefCell<HashMap<u32, IDWriteTextFormat>>,
 	/// D2D SolidColorBrush 缓存，key = RGBA 编码为 u64。
 	solid_brush_cache: RefCell<HashMap<u64, ID2D1SolidColorBrush>>,
+	/// swapchain 后缓冲区对应的 D2D bitmap（按缓冲区索引缓存，避免每帧重建）。
+	/// FLIP_SEQUENTIAL + BufferCount=2，所以 2 个条目。
+	back_buffer_bitmaps: [Option<ID2D1Bitmap1>; 2],
+	/// 背景画刷缓存（仅 `background_enabled` 时使用），opacity 变化时通过 SetColor 更新。
+	bg_brush: Option<ID2D1SolidColorBrush>,
 }
 
 impl DcompRenderer {
@@ -148,6 +154,8 @@ impl DcompRenderer {
 
 			let swapchain: IDXGISwapChain1 =
 				factory.CreateSwapChainForComposition(&d3d, &desc, None)?;
+			// 升级为 IDXGISwapChain3 以使用 GetCurrentBackBufferIndex（DXGI 1.3+）
+			let swapchain: IDXGISwapChain3 = swapchain.cast()?;
 
 			// ── 5. DComp ──
 			let dcomp_dev: IDCompositionDevice = DCompositionCreateDevice(Some(&dxgi))?;
@@ -166,6 +174,14 @@ impl DcompRenderer {
 			// 需要 IDWriteFactory3（Windows 10+），如果系统不支持则跳过
 			let emoji_fallback = build_emoji_fallback(&dwrite).ok();
 
+			// ── 8. 后缓冲区 D2D bitmap 缓存（懒初始化） ──
+			// FLIP_SEQUENTIAL + BufferCount=2，有 2 个缓冲区。
+			// 首次 render 时通过 GetCurrentBackBufferIndex 选择对应 buffer 创建 bitmap，
+			// 后续帧复用。避免每帧 CreateBitmapFromDxgiSurface。
+			// 注意：不能在 new() 中预创建两个 bitmap，因为初始时 buffer 1 是 front buffer，
+			// D2D 拒绝对 front buffer 创建 TARGET bitmap（E_INVALIDARG）。
+			let back_buffer_bitmaps: [Option<ID2D1Bitmap1>; 2] = [None, None];
+
 			Ok(Self {
 				dcomp_device: dcomp_dev,
 				dcomp_visual: visual,
@@ -181,6 +197,8 @@ impl DcompRenderer {
 				background_opacity,
 				text_format_cache: RefCell::new(HashMap::new()),
 				solid_brush_cache: RefCell::new(HashMap::new()),
+				back_buffer_bitmaps,
+				bg_brush: None,
 			})
 		}
 	}
@@ -195,24 +213,25 @@ impl DcompRenderer {
 	///
 	/// # 返回值
 	///
-	/// 创建的 D2D bitmap，可用于 DrawBitmap 渲染。
+	/// 创建的 D2D bitmap（`ID2D1Bitmap1`），可用于 `ID2D1DeviceContext::DrawBitmap` 渲染。
 	pub fn create_bitmap_from_rgba(
 		&self,
 		data: &[u8],
 		width: u32,
 		height: u32,
-	) -> Result<ID2D1Bitmap> {
+	) -> Result<ID2D1Bitmap1> {
 		unsafe {
-			let props = D2D1_BITMAP_PROPERTIES {
+			let props = D2D1_BITMAP_PROPERTIES1 {
 				pixelFormat: D2D1_PIXEL_FORMAT {
 					format: DXGI_FORMAT_B8G8R8A8_UNORM,
 					alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
 				},
 				dpiX: 96.0,
 				dpiY: 96.0,
+				bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+				colorContext: core::mem::ManuallyDrop::new(None),
 			};
-			let rt: ID2D1RenderTarget = self.d2d_context.cast()?;
-			let bitmap = rt.CreateBitmap(
+			let bitmap = self.d2d_context.CreateBitmap(
 				D2D_SIZE_U { width, height },
 				Some(data.as_ptr() as *const _),
 				width * 4,
@@ -225,6 +244,7 @@ impl DcompRenderer {
 	/// 测量文本渲染宽度。
 	///
 	/// 用于弹幕轨道分配时判断弹幕何时完全移出屏幕。
+	/// 内部委托给 [`build_text_layout`](Self::build_text_layout)，复用 TextFormat 缓存。
 	///
 	/// # 参数
 	///
@@ -234,13 +254,41 @@ impl DcompRenderer {
 	/// # 返回值
 	///
 	/// 文本在 DWrite 布局中的宽度（像素）。失败时返回 `Err`。
+	#[allow(dead_code)]
 	pub fn measure_text_width(&self, text: &[u16], font_size: f32) -> Result<f32> {
+		Ok(self.build_text_layout(text, font_size)?.1)
+	}
+
+	/// 构建一个可复用的 `IDWriteTextLayout`（含 font fallback 设置）。
+	///
+	/// 在添加弹幕时调用一次，将返回的 layout 存入 `ProcessedSegment::Text`，
+	/// 渲染时每帧直接复用，避免重复创建（`IDWriteTextLayout` 是 DWrite 中最昂贵的对象）。
+	///
+	/// # 参数
+	///
+	/// - `text` — 文本内容（UTF-16）
+	/// - `font_size` — 字体大小（像素）
+	///
+	/// # 返回值
+	///
+	/// 返回 `(IDWriteTextLayout, width)` — layout 和其渲染宽度（像素）。
+	pub fn build_text_layout(
+		&self,
+		text: &[u16],
+		font_size: f32,
+	) -> Result<(IDWriteTextLayout, f32)> {
 		unsafe {
-			let fmt = create_text_format(&self.dwrite_factory, font_size)?;
+			let fmt = self.get_or_create_text_format(font_size)?;
 			let layout = self.dwrite_factory.CreateTextLayout(text, &fmt, 10000.0, 10000.0)?;
+			// 一次性设置 font fallback（彩色 emoji），渲染时无需重复设置
+			if let (Some(fallback), Ok(layout2)) =
+				(&self.emoji_fallback, layout.cast::<IDWriteTextLayout2>())
+			{
+				let _ = layout2.SetFontFallback(fallback);
+			}
 			let mut m = DWRITE_TEXT_METRICS::default();
 			layout.GetMetrics(&mut m)?;
-			Ok(m.width as f32)
+			Ok((layout, m.width as f32))
 		}
 	}
 
@@ -265,11 +313,10 @@ impl DcompRenderer {
 	/// 渲染一帧弹幕。
 	///
 	/// 执行完整的渲染管线：
-	/// 1. 从 swapchain 获取后台缓冲区
-	/// 2. 创建 D2D bitmap（`D2D1_ALPHA_MODE_PREMULTIPLIED`，与 swapchain 一致）
-	/// 3. Clear 为全透明背景
-	/// 4. 遍历弹幕列表，为每条弹幕创建 TextLayout 并用 SolidColorBrush 绘制
-	/// 5. EndDraw → Present → DComp Commit
+	/// 1. 通过 `GetCurrentBackBufferIndex` 选择预缓存的后缓冲区 bitmap
+	/// 2. Clear 为全透明背景
+	/// 3. 遍历弹幕列表，使用预缓存的 TextLayout 和 SolidColorBrush 绘制
+	/// 4. EndDraw → Present → DComp Commit
 	///
 	/// # 参数
 	///
@@ -280,47 +327,63 @@ impl DcompRenderer {
 	/// 渲染成功返回 `Ok(())`。如果 swapchain 丢失或 D2D 出错返回 `Err`。
 	pub fn render(&mut self, items: &[DanmakuItem]) -> Result<()> {
 		unsafe {
-			// ── 从交换链获取后台缓冲区 ──
-			let back_buffer: IDXGISurface = self.swapchain.GetBuffer(0)?;
-
-			// alphaMode 必须与 swapchain 的 DXGI_ALPHA_MODE_PREMULTIPLIED 一致
-			let bmp_props = D2D1_BITMAP_PROPERTIES1 {
-				pixelFormat: D2D1_PIXEL_FORMAT {
-					format: DXGI_FORMAT_B8G8R8A8_UNORM,
-					alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-				},
-				dpiX: 96.0,
-				dpiY: 96.0,
-				bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-				colorContext: core::mem::ManuallyDrop::new(None),
-			};
-			let d2d_bitmap =
-				self.d2d_context.CreateBitmapFromDxgiSurface(&back_buffer, Some(&bmp_props))?;
-
-			self.d2d_context.SetTarget(&d2d_bitmap);
+			// ── 选择当前后缓冲区对应的 bitmap（懒初始化 + 缓存复用） ──
+			// 首次访问某 buffer 时通过 CreateBitmapFromDxgiSurface 创建，后续帧直接复用。
+			// 不能在 new() 中预创建，因为初始 front buffer 不支持 TARGET 选项。
+			let idx = self.swapchain.GetCurrentBackBufferIndex() as usize;
+			if self.back_buffer_bitmaps[idx].is_none() {
+				let bmp_props = D2D1_BITMAP_PROPERTIES1 {
+					pixelFormat: D2D1_PIXEL_FORMAT {
+						format: DXGI_FORMAT_B8G8R8A8_UNORM,
+						alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+					},
+					dpiX: 96.0,
+					dpiY: 96.0,
+					bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+					colorContext: core::mem::ManuallyDrop::new(None),
+				};
+				let surface: IDXGISurface = self.swapchain.GetBuffer(idx as u32)?;
+				self.back_buffer_bitmaps[idx] = Some(
+					self.d2d_context.CreateBitmapFromDxgiSurface(&surface, Some(&bmp_props as *const _))?,
+				);
+			}
+			let d2d_bitmap = self.back_buffer_bitmaps[idx]
+				.as_ref()
+				.ok_or_else(|| Error::new(E_FAIL, "back buffer bitmap not initialized"))?;
+			self.d2d_context.SetTarget(d2d_bitmap);
 			self.d2d_context.BeginDraw();
 
-			// Clear 为全透明（需要 cast 到 ID2D1RenderTarget）
-			let rt: ID2D1RenderTarget = self.d2d_context.cast()?;
+			// Clear 为全透明（ID2D1DeviceContext 继承 ID2D1RenderTarget::Clear）
 			let clear_color = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
-			rt.Clear(Some(&clear_color));
+			self.d2d_context.Clear(Some(&clear_color));
 
 			// 在弹幕显示区域绘制半透明背景（可选）
 			if self.background_enabled && self.display_area_height > 0.0 {
 				let bg_color = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: self.background_opacity };
-				let bg_brush: ID2D1SolidColorBrush = rt.CreateSolidColorBrush(&bg_color, None)?;
+				// 缓存背景画刷：首次创建，后续通过 SetColor 更新 opacity
+				if self.bg_brush.is_none() {
+					self.bg_brush =
+						Some(self.d2d_context.CreateSolidColorBrush(&bg_color, None)?);
+				} else {
+					self.bg_brush.as_ref().unwrap().SetColor(&bg_color);
+				}
 				let bg_rect = D2D_RECT_F {
 					left: 0.0,
 					top: 0.0,
 					right: self.screen_width as f32,
 					bottom: self.display_area_height,
 				};
-				rt.FillRectangle(&bg_rect, &bg_brush);
+				self.d2d_context.FillRectangle(&bg_rect, self.bg_brush.as_ref().unwrap());
 			}
 
-			// 绘制每条弹幕（使用缓存的 text format 和 solid brush）
+			// 绘制每条弹幕（使用预缓存的 layout 和缓存的 brush）
+			let screen_w = self.screen_width as f32;
 			for item in items {
 				if !item.alive {
+					continue;
+				}
+				// 可见性裁剪：完全在屏幕外则跳过绘制
+				if item.x > screen_w || item.x + item.total_width < 0.0 {
 					continue;
 				}
 
@@ -328,43 +391,17 @@ impl DcompRenderer {
 
 				for segment in &item.segments {
 					match segment {
-						ProcessedSegment::Text { text, font_size, color, width } => {
-							let fmt = match self.get_or_create_text_format(*font_size) {
-								Ok(f) => f,
-								Err(_) => {
-									cursor_x += width;
-									continue;
-								}
-							};
-							let layout = match self
-								.dwrite_factory
-								.CreateTextLayout(text, &fmt, 10000.0, 10000.0)
-							{
-								Ok(l) => l,
-								Err(_) => {
-									cursor_x += width;
-									continue;
-								}
-							};
-
-							// 在 text layout 上设置自定义 font fallback（彩色 emoji）
-							if let (Some(fallback), Ok(layout2)) =
-								(&self.emoji_fallback, layout.cast::<IDWriteTextLayout2>())
-							{
-								let _ = layout2.SetFontFallback(fallback);
-							}
-
-							let brush = match self.get_or_create_brush(&rt, color) {
+						ProcessedSegment::Text { layout, color, width, .. } => {
+							let brush = match self.get_or_create_brush(color) {
 								Ok(b) => b,
 								Err(_) => {
 									cursor_x += width;
 									continue;
 								}
 							};
-
 							self.d2d_context.DrawTextLayout(
 								Vector2 { X: cursor_x, Y: item.y },
-								&layout,
+								layout,
 								&brush,
 								D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
 							);
@@ -377,14 +414,15 @@ impl DcompRenderer {
 								right: cursor_x + width,
 								bottom: item.y + y_offset + height,
 							};
-							rt.DrawBitmap(
+							// ID2D1DeviceContext::DrawBitmap（7 参数版本，接受 ID2D1Bitmap1）
+							self.d2d_context.DrawBitmap(
 								bitmap,
 								Some(&dest as *const _),
 								1.0,
-								D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+								D2D1_INTERPOLATION_MODE_LINEAR,
+								None,
 								None,
 							);
-							// DrawBitmap 不返回 Result（D2D 延迟错误到 EndDraw）
 							cursor_x += width;
 						}
 					}
@@ -419,11 +457,7 @@ impl DcompRenderer {
 	/// 获取或创建缓存的实心画刷，避免每段每帧重复创建。
 	///
 	/// 画刷颜色来自 [u8; 4] RGBA 值，编码为单个 u64 作为缓存键。
-	fn get_or_create_brush(
-		&self,
-		rt: &ID2D1RenderTarget,
-		color: &[u8; 4],
-	) -> Result<ID2D1SolidColorBrush> {
+	fn get_or_create_brush(&self, color: &[u8; 4]) -> Result<ID2D1SolidColorBrush> {
 		let key = ((color[0] as u64) << 32)
 			| ((color[1] as u64) << 24)
 			| ((color[2] as u64) << 16)
@@ -438,8 +472,9 @@ impl DcompRenderer {
 			b: color[2] as f32 / 255.0,
 			a: color[3] as f32 / 255.0,
 		};
-		// SAFETY: CreateSolidColorBrush 在单线程渲染循环中安全调用
-		let brush = unsafe { rt.CreateSolidColorBrush(&d2d_color, None)? };
+		// SAFETY: ID2D1DeviceContext 继承 ID2D1RenderTarget::CreateSolidColorBrush,
+		// 在单线程渲染循环中安全调用
+		let brush = unsafe { self.d2d_context.CreateSolidColorBrush(&d2d_color, None)? };
 		cache.insert(key, brush.clone());
 		Ok(brush)
 	}

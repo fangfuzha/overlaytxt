@@ -1,4 +1,5 @@
-use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
+use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
+use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
 
 /// 弹幕管理器 — 持有所有活跃弹幕，处理生命周期和轨道分配。
 ///
@@ -51,9 +52,10 @@ impl DanmakuManager {
 		}
 	}
 
-	/// 添加一条纯文字弹幕（兼容旧 API）。
+	/// 添加一条纯文字弹幕。
 	///
-	/// 自动分配轨道，弹幕从屏幕右边缘进入。`text` 为预编码的 UTF-16。
+	/// 自动分配轨道，弹幕从屏幕右边缘进入。`text` 为预编码的 UTF-16，
+	/// `layout` 为预先构建的 DWrite 文本布局（含 font fallback），每帧复用。
 	pub fn add_text(
 		&mut self,
 		text: Vec<u16>,
@@ -61,6 +63,7 @@ impl DanmakuManager {
 		color: [u8; 4],
 		speed: f32,
 		text_width: f32,
+		layout: IDWriteTextLayout,
 	) {
 		if self.max_items > 0 && self.items.len() >= self.max_items {
 			return;
@@ -71,7 +74,7 @@ impl DanmakuManager {
 		};
 		let y = self.track_system.track_y(track);
 
-		let segment = ProcessedSegment::Text { text, font_size, color, width: text_width };
+		let segment = ProcessedSegment::Text { text, font_size, color, width: text_width, layout };
 		let total_width = text_width;
 
 		self.items.push(DanmakuItem {
@@ -133,6 +136,7 @@ impl DanmakuManager {
 		}
 
 		let mut any_alive = false;
+		let mut any_died = false;
 
 		for item in &mut self.items {
 			if !item.alive {
@@ -144,12 +148,16 @@ impl DanmakuManager {
 			if item.x + item.total_width < 0.0 {
 				item.alive = false;
 				self.track_system.release_track(item.track);
+				any_died = true;
 			} else {
 				any_alive = true;
 			}
 		}
 
-		self.items.retain(|item| item.alive);
+		// 仅在有弹幕死亡时才调用 retain,避免无死亡时每帧 O(n) 空扫描
+		if any_died {
+			self.items.retain(|item| item.alive);
+		}
 
 		any_alive
 	}
@@ -253,18 +261,26 @@ pub enum ProcessedSegment {
 	/// 文字段
 	Text {
 		/// 文本内容（预编码为 UTF-16，避免每帧临时分配）
+		///
+		/// 注意：渲染时通过 `layout` 绘制，此字段保留供外部检视。
+		#[allow(dead_code)]
 		text: Vec<u16>,
 		/// 字体大小（像素）
+		///
+		/// 注意：渲染时通过 `layout` 绘制，此字段保留供外部检视。
+		#[allow(dead_code)]
 		font_size: f32,
 		/// RGBA 颜色
 		color: [u8; 4],
 		/// 文本渲染宽度（像素），由外部预先测量
 		width: f32,
+		/// 预构建的 DWrite 文本布局（含 font fallback），每帧复用，避免重复创建
+		layout: IDWriteTextLayout,
 	},
 	/// 图片段
 	Image {
 		/// D2D bitmap（render-thread only，COM 对象）
-		bitmap: ID2D1Bitmap,
+		bitmap: ID2D1Bitmap1,
 		/// 渲染宽度（像素）
 		width: f32,
 		/// 渲染高度（像素）
@@ -428,6 +444,27 @@ pub fn straight_to_premul(rgba: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use windows::core::HSTRING;
+	use windows::Win32::Graphics::DirectWrite::*;
+
+	/// 测试辅助：创建一个真实的 IDWriteTextLayout（用于满足 add_text 的新签名）
+	fn make_test_layout() -> IDWriteTextLayout {
+		unsafe {
+			let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED).unwrap();
+			let fmt = factory
+				.CreateTextFormat(
+					&HSTRING::from("Microsoft YaHei"),
+					None,
+					DWRITE_FONT_WEIGHT_NORMAL,
+					DWRITE_FONT_STYLE_NORMAL,
+					DWRITE_FONT_STRETCH_NORMAL,
+					28.0,
+					&HSTRING::from("zh-CN"),
+				)
+				.unwrap();
+			factory.CreateTextLayout(&[65; 10], &fmt, 10000.0, 10000.0).unwrap()
+		}
+	}
 
 	#[test]
 	fn test_track_system_allocate_release() {
@@ -474,16 +511,16 @@ mod tests {
 	fn test_danmaku_manager_max_items() {
 		let mut dm = DanmakuManager::new(1920.0, 1080.0, 40.0, 1.0);
 		dm.set_max_danmaku(2);
-		dm.add_text(vec![65; 10], 28.0, [255; 4], 150.0, 100.0);
-		dm.add_text(vec![66; 10], 28.0, [255; 4], 150.0, 100.0);
-		dm.add_text(vec![67; 10], 28.0, [255; 4], 150.0, 100.0);
+		dm.add_text(vec![65; 10], 28.0, [255; 4], 150.0, 100.0, make_test_layout());
+		dm.add_text(vec![66; 10], 28.0, [255; 4], 150.0, 100.0, make_test_layout());
+		dm.add_text(vec![67; 10], 28.0, [255; 4], 150.0, 100.0, make_test_layout());
 		assert_eq!(dm.items.len(), 2);
 	}
 
 	#[test]
 	fn test_pause_resume() {
 		let mut dm = DanmakuManager::new(1920.0, 1080.0, 40.0, 1.0);
-		dm.add_text(vec![65; 10], 28.0, [255; 4], 150.0, 100.0);
+		dm.add_text(vec![65; 10], 28.0, [255; 4], 150.0, 100.0, make_test_layout());
 		let x_before = dm.items[0].x;
 		dm.pause();
 		dm.update(1.0);

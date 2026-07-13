@@ -192,8 +192,8 @@ impl OverlayTxt {
 	/// 内部执行以下操作：
 	/// 1. 声明当前进程为 DPI 感知
 	/// 2. 创建全屏顶层透明窗口（`WS_EX_LAYERED / WS_EX_TRANSPARENT`）
-	/// 3. 初始化 D3D11 + D2D + DWrite + DComp 渲染管线
-	/// 4. 启动基于 `WM_TIMER` 的 60 FPS 渲染循环
+/// 3. 初始化 D3D11 + D2D + DWrite + DComp 渲染管线
+		/// 4. 启动帧循环，通过 `DwmFlush` 与屏幕 VSync 同步（自动适配显示器刷新率）
 	///
 	/// 多次调用安全，第二次及后续调用直接返回 `Ok`。
 	pub fn start(&mut self) -> Result<(), OverlayTxtError> {
